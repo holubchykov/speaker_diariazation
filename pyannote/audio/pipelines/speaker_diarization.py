@@ -464,12 +464,20 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         hook("segmentation", segmentations)
         #   shape: (num_chunks, num_frames, local_num_speakers)
 
+        # binarize segmentation
+        if self._segmentation.model.specifications.powerset:
+            binarized_segmentations = segmentations
+        else:
+            binarized_segmentations: SlidingWindowFeature = binarize(
+                segmentations,
+                onset=self.segmentation.threshold,
+                initial_state=False,
+            )
+
         # estimate frame-level number of instantaneous speakers
         count = self.speaker_count(
-            segmentations,
-            onset=0.5
-            if self._segmentation.model.specifications.powerset
-            else self.segmentation.threshold,
+            binarized_segmentations,
+            max_speakers,
             frames=self._frames,
         )
         hook("speaker_counting", count)
@@ -482,16 +490,6 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             if return_embeddings:
                 return diarization, {}
             return diarization
-
-        # binarize segmentation
-        if self._segmentation.model.specifications.powerset:
-            binarized_segmentations = segmentations
-        else:
-            binarized_segmentations: SlidingWindowFeature = binarize(
-                segmentations,
-                onset=self.segmentation.threshold,
-                initial_state=False,
-            )
 
         if self.klustering == "OracleClustering":
             embeddings = None
@@ -515,6 +513,19 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             frames=self._frames,  # <== for oracle clustering
         )
         #   hard_clusters: (num_chunks, num_speakers)
+
+        # number of detected clusters is the number of different speakers
+        num_different_speakers = centroids.shape[0]
+        # quick sanity check
+        assert (
+            num_different_speakers >= min_speakers
+            and num_different_speakers <= max_speakers
+        )
+
+        # during counting, we could possibly overcount the number of instantaneous
+        # speakers due to segmentation errors, so we cap the maximum instantaneous number
+        # of speakers by the number of detected clusters
+        count.data = np.minimum(count.data, num_different_speakers)
 
         # reconstruct discrete diarization from raw hard clusters
 
@@ -558,14 +569,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         if not return_embeddings:
             return diarization
         else:
-            embedding_map = {}
-            # TODO: The number of centroids may be smaller than the number of speakers
-            # in the annotation. This can happen if the number of active speakers
-            # obtained from `speaker_count` for some frames is larger than the number
-            # of clusters obtained from `clustering`. Will be fixed in the future
-            for k, label in label_map.items():
-                if k < centroids.shape[0]:
-                    embedding_map[label] = centroids[k]
+            embedding_map = {label: centroids[k] for k, label in label_map.items()}
             return diarization, embedding_map
 
     def get_metric(self) -> GreedyDiarizationErrorRate:
