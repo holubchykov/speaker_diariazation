@@ -25,6 +25,7 @@
 import functools
 import itertools
 import math
+import warnings
 from typing import Callable, Optional, Text, Union
 
 import numpy as np
@@ -517,10 +518,11 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         # number of detected clusters is the number of different speakers
         num_different_speakers = centroids.shape[0]
         # quick sanity check
-        assert (
-            num_different_speakers >= min_speakers
-            and num_different_speakers <= max_speakers
-        )
+        if num_different_speakers < min_speakers or num_different_speakers > max_speakers:
+            warnings.warn(
+                f"Number of detected speakers ({num_different_speakers}) "
+                f"outside of [{min_speakers}, {max_speakers}] range"
+            )
 
         # during counting, we could possibly overcount the number of instantaneous
         # speakers due to segmentation errors, so we cap the maximum instantaneous number
