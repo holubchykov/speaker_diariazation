@@ -57,6 +57,12 @@ try:
 except ImportError:
     NEMO_IS_AVAILABLE = False
 
+try:
+    from transformers import AutoFeatureExtractor, WavLMForXVector
+    TRANSFORMERS_IS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_IS_AVAILABLE = False
+
 
 class NeMoPretrainedSpeakerEmbedding(BaseInference):
     def __init__(
@@ -64,7 +70,6 @@ class NeMoPretrainedSpeakerEmbedding(BaseInference):
         embedding: Text = "nvidia/speakerverification_en_titanet_large",
         device: torch.device = None,
     ):
-
         if not NEMO_IS_AVAILABLE:
             raise ImportError(
                 f"'NeMo' must be installed to use '{embedding}' embeddings. "
@@ -90,7 +95,6 @@ class NeMoPretrainedSpeakerEmbedding(BaseInference):
 
     @cached_property
     def dimension(self) -> int:
-
         input_signal = torch.rand(1, self.sample_rate).to(self.device)
         input_signal_length = torch.tensor([self.sample_rate]).to(self.device)
         _, embeddings = self.model_(
@@ -105,7 +109,6 @@ class NeMoPretrainedSpeakerEmbedding(BaseInference):
 
     @cached_property
     def min_num_samples(self) -> int:
-
         lower, upper = 2, round(0.5 * self.sample_rate)
         middle = (lower + upper) // 2
         while lower + 1 < upper:
@@ -152,7 +155,6 @@ class NeMoPretrainedSpeakerEmbedding(BaseInference):
             wav_lens = signals.shape[1] * torch.ones(batch_size)
 
         else:
-
             batch_size_masks, _ = masks.shape
             assert batch_size == batch_size_masks
 
@@ -229,7 +231,6 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
         device: torch.device = None,
         use_auth_token: Union[Text, None] = None,
     ):
-
         if not SPEECHBRAIN_IS_AVAILABLE:
             raise ImportError(
                 f"'speechbrain' must be installed to use '{embedding}' embeddings. "
@@ -281,7 +282,6 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
 
     @cached_property
     def min_num_samples(self) -> int:
-
         lower, upper = 2, round(0.5 * self.sample_rate)
         middle = (lower + upper) // 2
         while lower + 1 < upper:
@@ -318,13 +318,11 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
         assert num_channels == 1
 
         waveforms = waveforms.squeeze(dim=1)
-
         if masks is None:
             signals = waveforms.squeeze(dim=1)
             wav_lens = signals.shape[1] * torch.ones(batch_size)
 
         else:
-
             batch_size_masks, _ = masks.shape
             assert batch_size == batch_size_masks
 
@@ -339,13 +337,10 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
 
             imasks = imasks > 0.5
 
-            signals = pad_sequence(
-                [
-                    waveform[imask].contiguous()
-                    for waveform, imask in zip(waveforms, imasks)
-                ],
-                batch_first=True,
-            )
+            signals = pad_sequence([
+                waveform[imask].contiguous()
+                for waveform, imask in zip(waveforms, imasks)
+            ], batch_first=True)
 
             wav_lens = imasks.sum(dim=1)
 
@@ -361,6 +356,140 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
 
         embeddings = (
             self.classifier_.encode_batch(signals, wav_lens=wav_lens)
+            .squeeze(dim=1)
+            .cpu()
+            .numpy()
+        )
+
+        embeddings[too_short.cpu().numpy()] = np.NAN
+
+        return embeddings
+
+
+class WavLMPretrainedSpeakerEmbedding(BaseInference):
+    """WavLM-based pretrained speaker embedding
+
+    """
+    def __init__(
+        self,
+        embedding: Text = "microsoft/wavlm-base-plus-sv",
+        device: torch.device = None,
+        use_auth_token: Union[Text, None] = None,
+    ):
+        if not TRANSFORMERS_IS_AVAILABLE:
+            raise ImportError(
+                f"'transformers' must be installed to use '{embedding}' embeddings. "
+                "Visit https://huggingface.co/transformers/installation.html for installation instructions."
+            )
+
+        super().__init__()
+
+        self.embedding = embedding
+        self.device = device or torch.device("cpu")
+        self.use_auth_token = use_auth_token
+
+        self.feature_extractor_ = AutoFeatureExtractor.from_pretrained(self.embedding, use_auth_token=self.use_auth_token)
+        self.model_ = WavLMForXVector.from_pretrained(self.embedding, use_auth_token=self.use_auth_token)
+
+    def to(self, device: torch.device):
+        self.model_ = self.model_.to(device)
+        self.device = device
+        return self
+
+    def _encode_batch(self, batch, masks=None):
+        with torch.no_grad():
+            if isinstance(batch, torch.Tensor):
+                if masks is None:
+                    masks = torch.ones_like(batch, dtype=torch.int32)
+
+                inputs = dict(input_values=batch, attention_mask=masks)
+            else:
+                inputs = self.feature_extractor_(batch, sampling_rate=self.sample_rate, return_tensors="pt", padding=True)
+
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            embeddings = self.model_(**inputs).embeddings
+            embeddings = F.normalize(embeddings, dim=-1)
+            return embeddings
+
+    @cached_property
+    def sample_rate(self) -> int:
+        return self.feature_extractor_.sampling_rate
+
+    @cached_property
+    def dimension(self) -> int:
+        return self.model_.config.xvector_output_dim
+
+    @cached_property
+    def metric(self) -> str:
+        return "cosine"
+
+    @cached_property
+    def min_num_samples(self) -> int:
+        lower, upper = 2, round(0.5 * self.sample_rate)
+        middle = (lower + upper) // 2
+        while lower + 1 < upper:
+            try:
+                _ = self._encode_batch(torch.randn(1, middle, device=self.device))
+                upper = middle
+            except RuntimeError:
+                lower = middle
+
+            middle = (lower + upper) // 2
+
+        return upper
+
+
+    def __call__(
+        self, waveforms: torch.Tensor, masks: torch.Tensor = None
+    ) -> np.ndarray:
+        """
+
+        Parameters
+        ----------
+        waveforms : (batch_size, num_channels, num_samples)
+            Only num_channels == 1 is supported.
+        masks : (batch_size, num_samples), optional
+
+        Returns
+        -------
+        embeddings : (batch_size, dimension)
+
+        """
+
+        batch_size, num_channels, num_samples = waveforms.shape
+        assert num_channels == 1
+
+        waveforms = waveforms.squeeze(dim=1)
+        if masks is None:
+            wav_lens = waveforms.shape[1] * torch.ones(batch_size)
+            imasks = None
+
+        else:
+            batch_size_masks, _ = masks.shape
+            assert batch_size == batch_size_masks
+
+            imasks = F.interpolate(
+                masks.unsqueeze(dim=1), size=num_samples, mode="nearest"
+            ).squeeze(dim=1)
+
+            imasks = imasks > 0.5
+
+            wav_lens = imasks.sum(dim=1)
+
+        max_len = wav_lens.max()
+
+        # corner case: every signal is too short
+        if max_len < self.min_num_samples:
+            return np.NAN * np.zeros((batch_size, self.dimension))
+
+        too_short = wav_lens < self.min_num_samples
+        wav_lens = wav_lens / max_len
+        wav_lens[too_short] = 1.0
+
+        embeddings = (
+            # WavLM feature extractor will pad signals internally
+            # and provide necessary attention masks
+            self._encode_batch(waveforms, imasks)
             .squeeze(dim=1)
             .cpu()
             .numpy()
@@ -493,6 +622,8 @@ def PretrainedSpeakerEmbedding(
 
     elif isinstance(embedding, str) and "nvidia" in embedding:
         return NeMoPretrainedSpeakerEmbedding(embedding, device=device)
+    elif isinstance(embedding, str) and "wavlm" in embedding:
+        return WavLMPretrainedSpeakerEmbedding(embedding, device=device)
 
     else:
         return PyannoteAudioPretrainedSpeakerEmbedding(
@@ -557,7 +688,6 @@ class SpeakerEmbedding(Pipeline):
             )
 
     def apply(self, file: AudioFile) -> np.ndarray:
-
         device = self.embedding_model_.device
 
         # read audio file and send it to GPU
@@ -583,7 +713,6 @@ def main(
     embedding: str = "pyannote/embedding",
     segmentation: str = None,
 ):
-
     import typer
     from pyannote.database import FileFinder, get_protocol
     from pyannote.metrics.binary_classification import det_curve
@@ -601,7 +730,6 @@ def main(
     trials = getattr(protocol, f"{subset}_trial")()
 
     for t, trial in enumerate(tqdm(trials)):
-
         audio1 = trial["file1"]["audio"]
         if audio1 not in emb:
             emb[audio1] = pipeline(audio1)
