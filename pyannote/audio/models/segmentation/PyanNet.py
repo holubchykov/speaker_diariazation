@@ -233,7 +233,7 @@ class WavLMWrapper(nn.Module):
             wavs = wavs.squeeze(1)
 
         att_masks = torch.ones_like(wavs).to(torch.int32)
-        outputs = self.wavlm(input_values=wavs, attention_mask=att_masks)
+        outputs = self.wavlm(input_values=wavs, attention_mask=att_masks, output_hidden_states=self.use_weighted_sum)
 
         if self.use_weighted_sum:
             stacked = torch.stack(outputs.hidden_states, dim=-1)
