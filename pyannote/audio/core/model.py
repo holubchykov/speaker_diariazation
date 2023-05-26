@@ -128,7 +128,7 @@ class Introspection:
                     frames = model(example_input_array[:, :, :num_samples])
                 if task is not None:
                     frames = frames[task]
-            except Exception:
+            except Exception as e:
                 lower = num_samples
             else:
                 min_num_samples = num_samples
@@ -282,8 +282,8 @@ class Model(pl.LightningModule):
 
     @property
     def example_input_array(self) -> torch.Tensor:
-        batch_size = 3 if self.task is None else self.task.batch_size
-        duration = 2.0 if self.task is None else self.task.duration
+        batch_size = 3 if self.task is None else getattr(self.task, "batch_size", 3)
+        duration = 2.0 if self.task is None else getattr(self.task, "duration", 2.0)
 
         return torch.randn(
             (

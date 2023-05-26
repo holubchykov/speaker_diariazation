@@ -21,7 +21,7 @@
 # SOFTWARE.
 
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -35,10 +35,17 @@ from pyannote.audio.models.blocks.sincnet import SincNet
 from pyannote.audio.utils.params import merge_dict
 
 
-class PyanNet(Model):
+try:
+    from transformers import WavLMModel
+    TRANSFORMERS_IS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_IS_AVAILABLE = False
+
+
+class PyanNetBase(Model):
     """PyanNet segmentation model
 
-    SincNet > LSTM > Feed forward > Classifier
+    Feature extractor (e.g. SincNet) > LSTM > Feed forward > Classifier
 
     Parameters
     ----------
@@ -61,7 +68,6 @@ class PyanNet(Model):
         i.e. two linear layers with 128 units each.
     """
 
-    SINCNET_DEFAULTS = {"stride": 10}
     LSTM_DEFAULTS = {
         "hidden_size": 128,
         "num_layers": 2,
@@ -73,7 +79,8 @@ class PyanNet(Model):
 
     def __init__(
         self,
-        sincnet: dict = None,
+        base_net: nn.Module,
+        base_feature_dim: int,
         lstm: dict = None,
         linear: dict = None,
         sample_rate: int = 16000,
@@ -83,55 +90,59 @@ class PyanNet(Model):
 
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
 
-        sincnet = merge_dict(self.SINCNET_DEFAULTS, sincnet)
-        sincnet["sample_rate"] = sample_rate
         lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
         lstm["batch_first"] = True
         linear = merge_dict(self.LINEAR_DEFAULTS, linear)
-        self.save_hyperparameters("sincnet", "lstm", "linear")
+        self.save_hyperparameters("lstm", "linear")
 
-        self.sincnet = SincNet(**self.hparams.sincnet)
+        # The name `sincnet` is preserved ONLY for backward compatibility with pre-trained weights
+        self.sincnet = base_net
 
-        monolithic = lstm["monolithic"]
-        if monolithic:
-            multi_layer_lstm = dict(lstm)
-            del multi_layer_lstm["monolithic"]
-            self.lstm = nn.LSTM(60, **multi_layer_lstm)
+        if lstm["num_layers"] > 0:
+            monolithic = lstm["monolithic"]
+            if monolithic:
+                multi_layer_lstm = dict(lstm)
+                del multi_layer_lstm["monolithic"]
+                self.lstm = nn.LSTM(base_feature_dim, **multi_layer_lstm)
 
-        else:
-            num_layers = lstm["num_layers"]
-            if num_layers > 1:
-                self.dropout = nn.Dropout(p=lstm["dropout"])
+            else:
+                num_layers = lstm["num_layers"]
+                if num_layers > 1:
+                    self.dropout = nn.Dropout(p=lstm["dropout"])
 
-            one_layer_lstm = dict(lstm)
-            one_layer_lstm["num_layers"] = 1
-            one_layer_lstm["dropout"] = 0.0
-            del one_layer_lstm["monolithic"]
+                one_layer_lstm = dict(lstm)
+                one_layer_lstm["num_layers"] = 1
+                one_layer_lstm["dropout"] = 0.0
+                del one_layer_lstm["monolithic"]
 
-            self.lstm = nn.ModuleList(
-                [
-                    nn.LSTM(
-                        60
-                        if i == 0
-                        else lstm["hidden_size"] * (2 if lstm["bidirectional"] else 1),
-                        **one_layer_lstm
-                    )
-                    for i in range(num_layers)
-                ]
-            )
+                self.lstm = nn.ModuleList(
+                    [
+                        nn.LSTM(
+                            base_feature_dim
+                            if i == 0
+                            else lstm["hidden_size"] * (2 if lstm["bidirectional"] else 1),
+                            **one_layer_lstm
+                        )
+                        for i in range(num_layers)
+                    ]
+                )
 
         if linear["num_layers"] < 1:
             return
 
-        lstm_out_features: int = self.hparams.lstm["hidden_size"] * (
-            2 if self.hparams.lstm["bidirectional"] else 1
-        )
+        if lstm["num_layers"] > 0:
+            linear_in_features = self.hparams.lstm["hidden_size"] * (
+                2 if self.hparams.lstm["bidirectional"] else 1
+            )
+        else:
+            linear_in_features = base_feature_dim
+
         self.linear = nn.ModuleList(
             [
                 nn.Linear(in_features, out_features)
                 for in_features, out_features in pairwise(
                     [
-                        lstm_out_features,
+                        linear_in_features,
                     ]
                     + [self.hparams.linear["hidden_size"]]
                     * self.hparams.linear["num_layers"]
@@ -143,10 +154,12 @@ class PyanNet(Model):
 
         if self.hparams.linear["num_layers"] > 0:
             in_features = self.hparams.linear["hidden_size"]
-        else:
+        elif self.hparams.lstm["num_layers"] > 0:
             in_features = self.hparams.lstm["hidden_size"] * (
                 2 if self.hparams.lstm["bidirectional"] else 1
             )
+        else:
+            raise ValueError("where is PyanNet's head?")
 
         if self.specifications.powerset:
             out_features = self.specifications.num_powerset_classes
@@ -169,20 +182,92 @@ class PyanNet(Model):
         """
 
         outputs = self.sincnet(waveforms)
+        outputs = rearrange(outputs, "batch feature frame -> batch frame feature")
 
-        if self.hparams.lstm["monolithic"]:
-            outputs, _ = self.lstm(
-                rearrange(outputs, "batch feature frame -> batch frame feature")
-            )
-        else:
-            outputs = rearrange(outputs, "batch feature frame -> batch frame feature")
-            for i, lstm in enumerate(self.lstm):
-                outputs, _ = lstm(outputs)
-                if i + 1 < self.hparams.lstm["num_layers"]:
-                    outputs = self.dropout(outputs)
+        if self.hparams.lstm["num_layers"] > 0:
+            if self.hparams.lstm["monolithic"]:
+                outputs, _ = self.lstm(outputs)
+            else:
+                for i, lstm in enumerate(self.lstm):
+                    outputs, _ = lstm(outputs)
+                    if i + 1 < self.hparams.lstm["num_layers"]:
+                        outputs = self.dropout(outputs)
 
         if self.hparams.linear["num_layers"] > 0:
             for linear in self.linear:
                 outputs = F.leaky_relu(linear(outputs))
 
         return self.activation(self.classifier(outputs))
+
+
+class PyanNet(PyanNetBase):
+    """
+    Standard PyanNet segmentation module based on SincNet.
+
+    Parameters:
+    sincnet : dict, optional
+        Keyword arugments passed to the SincNet block.
+        Defaults to {"stride": 10}.
+
+    **kwargs : parameters for PyanNetBase
+    """
+    SINCNET_DEFAULTS = {"stride": 10}
+
+    def __init__(
+        self,
+        sincnet: dict = None,
+        **kwargs,
+    ):
+        sincnet = merge_dict(self.SINCNET_DEFAULTS, sincnet)
+        sincnet["sample_rate"] = kwargs.get("sample_rate", 16000)
+        self.save_hyperparameters("sincnet")
+
+        super().__init__(base_net=SincNet(**self.hparams.sincnet), base_feature_dim=60, **kwargs)
+
+
+class WavLMWrapper(nn.Module):
+    def __init__(self, wavlm: WavLMModel):
+        super().__init__()
+        self.wavlm = wavlm
+
+    def forward(self, wavs):
+        # squeeze channel dimension if present
+        if wavs.ndim > 2:
+            wavs = wavs.squeeze(1)
+
+        att_masks = torch.ones_like(wavs).to(torch.int32)
+        outputs = self.wavlm(input_values=wavs, attention_mask=att_masks).last_hidden_state
+        return rearrange(outputs, "batch frame feature -> batch feature frame")
+
+
+class PyanNetWavLM(PyanNetBase):
+    """
+    PyanNet implementation which uses pre-trained WavLM as base network.
+
+    Parameters:
+    wavlm : Union[WavLMModel, str]
+        WavLM model or path to the pretrained model (local or Huggingface)
+    freeze_wavlm_weights : bool
+        Whether to freeze WavLM weights during training (default `True`)
+    
+    **kwargs : parameters for PyanNetBase
+    """
+    def __init__(
+        self, 
+        wavlm: Union[WavLMModel, str], 
+        freeze_wavlm_weights: bool = True, 
+        **kwargs
+    ):
+        if not TRANSFORMERS_IS_AVAILABLE:
+            raise ImportError("Please install transformers to use PyanNetWavLM")
+
+        if isinstance(wavlm, str):
+            wavlm = WavLMModel.from_pretrained(wavlm)
+        
+        self.save_hyperparameters("freeze_wavlm_weights")
+        super().__init__(base_net=WavLMWrapper(wavlm), base_feature_dim=wavlm.config.hidden_size, **kwargs)
+
+    def build(self):
+        super().build()
+        if self.hparams.freeze_wavlm_weights:
+            self.freeze_by_name("sincnet")
