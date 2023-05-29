@@ -225,7 +225,7 @@ class WavLMWrapper(nn.Module):
         self.use_weighted_sum = use_weighted_sum
         
         if self.use_weighted_sum:
-            self.wsum = nn.Linear(self.wavlm.config.num_hidden_layers + 1, 1)
+            self.sum_weights = nn.Parameter(torch.randn(self.wavlm.config.num_hidden_layers + 1))
 
     def forward(self, wavs):
         # squeeze channel dimension if present
@@ -237,7 +237,7 @@ class WavLMWrapper(nn.Module):
 
         if self.use_weighted_sum:
             stacked = torch.stack(outputs.hidden_states, dim=-1)
-            summed = self.wsum(stacked).squeeze(-1)
+            summed = stacked @ F.softmax(self.sum_weights, dim=0)
             return rearrange(summed, "batch frame feature -> batch feature frame")
         else:
             return rearrange(outputs.last_hidden_state, "batch frame feature -> batch feature frame")
