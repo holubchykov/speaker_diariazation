@@ -76,6 +76,10 @@ class PyanNetBase(Model):
         "monolithic": True,
         "dropout": 0.0,
     }
+    TRANSFORMER_DEFAULTS = {
+        "num_layers": 0,
+        "nhead": 8,
+    }
     LINEAR_DEFAULTS = {"hidden_size": 128, "num_layers": 2}
 
     def __init__(
@@ -83,6 +87,7 @@ class PyanNetBase(Model):
         base_net: nn.Module,
         base_feature_dim: int,
         lstm: dict = None,
+        transformer: dict = None,
         linear: dict = None,
         sample_rate: int = 16000,
         num_channels: int = 1,
@@ -92,18 +97,30 @@ class PyanNetBase(Model):
 
         lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
         lstm["batch_first"] = True
+
+        transformer = merge_dict(self.TRANSFORMER_DEFAULTS, transformer)
+        transformer["batch_first"] = True
+
         linear = merge_dict(self.LINEAR_DEFAULTS, linear)
-        self.save_hyperparameters("lstm", "linear")
+        self.save_hyperparameters("lstm", "transformer", "linear", "base_feature_dim")
 
         # The name `sincnet` is preserved ONLY for backward compatibility with pre-trained weights
         self.sincnet = base_net
+
+        last_dim = base_feature_dim
+
+        if transformer["num_layers"] > 0:
+            num_layers = transformer.pop("num_layers")
+
+            transformer_layer = nn.TransformerEncoderLayer(last_dim, **transformer)
+            self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
 
         if lstm["num_layers"] > 0:
             monolithic = lstm["monolithic"]
             if monolithic:
                 multi_layer_lstm = dict(lstm)
                 del multi_layer_lstm["monolithic"]
-                self.lstm = nn.LSTM(base_feature_dim, **multi_layer_lstm)
+                self.lstm = nn.LSTM(last_dim, **multi_layer_lstm)
 
             else:
                 num_layers = lstm["num_layers"]
@@ -118,27 +135,24 @@ class PyanNetBase(Model):
                 self.lstm = nn.ModuleList(
                     [
                         nn.LSTM(
-                            base_feature_dim if i == 0 else lstm["hidden_size"] * (2 if lstm["bidirectional"] else 1),
+                            last_dim if i == 0 else lstm["hidden_size"] * (2 if lstm["bidirectional"] else 1),
                             **one_layer_lstm,
                         )
                         for i in range(num_layers)
                     ]
                 )
+            
+            last_dim = lstm["hidden_size"] * (2 if lstm["bidirectional"] else 1)
 
         if linear["num_layers"] < 1:
             return
-
-        if lstm["num_layers"] > 0:
-            linear_in_features = self.hparams.lstm["hidden_size"] * (2 if self.hparams.lstm["bidirectional"] else 1)
-        else:
-            linear_in_features = base_feature_dim
 
         self.linear = nn.ModuleList(
             [
                 nn.Linear(in_features, out_features)
                 for in_features, out_features in pairwise(
                     [
-                        linear_in_features,
+                        last_dim,
                     ]
                     + [self.hparams.linear["hidden_size"]] * self.hparams.linear["num_layers"]
                 )
@@ -151,7 +165,7 @@ class PyanNetBase(Model):
         elif self.hparams.lstm["num_layers"] > 0:
             in_features = self.hparams.lstm["hidden_size"] * (2 if self.hparams.lstm["bidirectional"] else 1)
         else:
-            raise ValueError("where is PyanNet's head?")
+            in_features = self.hparams.base_feature_dim
 
         if self.specifications.powerset:
             out_features = self.specifications.num_powerset_classes
@@ -175,6 +189,9 @@ class PyanNetBase(Model):
 
         outputs = self.sincnet(waveforms)
         outputs = rearrange(outputs, "batch feature frame -> batch frame feature")
+
+        if self.hparams.transformer["num_layers"] > 0:
+            outputs = self.transformer(outputs)
 
         if self.hparams.lstm["num_layers"] > 0:
             if self.hparams.lstm["monolithic"]:
