@@ -296,4 +296,5 @@ class PyanNetWavLM(PyanNetBase):
     def build(self):
         super().build()
         if self.hparams.freeze_wavlm_weights:
-            self.freeze_by_name("sincnet.wavlm")
+            for p in self.sincnet.wavlm.parameters(recurse=True):
+                p.requires_grad = False
